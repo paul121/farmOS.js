@@ -1,12 +1,67 @@
 const axios = require('axios');
 const compose = require('ramda/src/compose');
+const {create} = require('simple-oauth2');
 
-function farmOS(host, user, password) {
+function farmOS(host, client_id='farmos_development', client_secret='') {
+  const oauthCredentials = {
+    client: {
+      id: client_id,
+      // Cannot be null. Most be empty string for encoding in Authorization header.
+      secret: client_secret,
+    },
+    auth: {
+      tokenHost: host,
+      tokenPath: '/oauth2/token',
+      revokePath: '/oauth2/revoke',
+      authorizePath: '/oauth2/authorize',
+    },
+  }
+
+  // Instantiate simple-oauth2 library with farmOS server OAuth credentials.
+  const farmOAuth = create(oauthCredentials);
+
+  // Helper function to get an OAuth access token.
+  // This will attempt to refresh the token if needed.
+  // Returns a Promise that resvoles as the access token.
+  const getAccessToken = () => {
+    if (farm.token == null) {
+      throw new Error('client must be authorized before making requests.');
+    }
+    if (farm.token.expired()) {
+      const params = {
+        client_id,
+        client_secret,
+      };
+      return farm.token.refresh(params)
+        .then(accessToken => farm.useToken(accessToken.token).access_token)
+        .catch((err) => { throw err; });
+    }
+    return Promise.resolve(farm.token.token.access_token);
+  };
+
+  // Helper function to get a CSRF token.
+  // Returns a Promise that resolves as the token.
+  const getCSRFToken = (accessToken) => {
+    if (farm.csrfToken == null) {
+      const opts = {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        withCredentials: true,
+      };
+      return axios(host + '/restws/session/token', opts)
+      .then(res => { farm.csrfToken = res.data; return farm.csrfToken; })
+      .catch((error) => { throw error; })
+    }
+    return Promise.resolve(farm.csrfToken);
+  };
+
   function request(endpoint, {
     method = 'GET',
     payload = '',
-    token = '',
-    auth = false,
   } = {}) {
     const url = host + endpoint;
     // Set basic axios options, for a non-auth GET requests
@@ -19,35 +74,26 @@ function farmOS(host, user, password) {
       withCredentials: true,
     };
     // Axios options for non-auth POST and PUT requests
-    if ((method === 'POST' || method === 'PUT') && !auth) {
-      opts.headers['X-CSRF-Token'] = token;
+    if (method === 'POST' || method === 'PUT') {
       opts.data = JSON.stringify(payload);
     }
-    // Axios options for authentication GET requests
-    if (auth) {
-      opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-    }
-    // Axios options for authentication POST requests
-    if (method === 'POST' && auth) {
-      opts.data = `name=${payload.name}&pass=${payload.pass}&form_id=${payload.form_id}`; // eslint-disable-line camelcase
-      // Accept 30* status codes as valid response w/o redirecting,
-      // so we can get the cookie from headers
-      opts.maxRedirects = 0;
-      opts.validateStatus = status => (status >= 200 && status < 400);
-    }
-    // In Node, the cookie will be set explicitly, and needs to be added to the header
-    if (farm.cookie !== '') { // eslint-disable-line no-use-before-define
-      opts.headers.Cookie = farm.cookie; // eslint-disable-line no-use-before-define
-    }
-    return axios(url, opts)
-      .then((res) => {
-        // In Node, the cookie needs to be saved manually;
-        // browsers will ignore this and store the cookie automagically.
-        if (res.headers['set-cookie']) {
-          farm.cookie = res.headers['set-cookie'][0]; // eslint-disable-line prefer-destructuring, no-use-before-define
-        }
-        return res.data;
-      }).catch((err) => { throw err; });
+
+    // Return a chain of promises.
+    // First get an access token.
+    return getAccessToken().then(accessToken => {
+      opts.headers['Authorization'] = 'Bearer ' + accessToken;
+      return accessToken
+    })
+    // Get the CSRF token.
+    // An access Token is required to authenticate this request.
+    .then(accessToken => getCSRFToken(accessToken))
+    .then(csrfToken => {
+      opts.headers['X-CSRF-Token'] = csrfToken;
+      return axios(url, opts)
+        .then((res) => {
+          return res.data;
+        }).catch((err) => { throw err; });
+    })
   }
 
   // Recursive request for looping through multiple pages
@@ -108,27 +154,39 @@ function farmOS(host, user, password) {
   };
 
   const farm = {
-    authenticate() {
-      const payload = {
-        form_id: 'user_login',
-        name: user,
-        pass: password,
-      };
-      return request('/user/login', { method: 'POST', payload, auth: true })
-        .then(() => request('/restws/session/token', { auth: true })
-          .then(token => token)
-          .catch((error) => { throw error; }))
-        .catch((error) => { throw error; });
+    // Create a simple-oauth2 token object from existing token.
+    useToken(token) {
+      const newToken = farmOAuth.accessToken.create(token);
+      farm.token = newToken;
+      return farm.token.token;
+    },
+    authorize(user, password, scope = 'user_access') {
+      // Try to authenticate with OAuth if scope is provided.
+      if (user != null && password != null) {
+        const tokenConfig = {
+          username: user,
+          password: password,
+          scope,
+        };
+        return farmOAuth.ownerPassword.getToken(tokenConfig)
+          .then((result) => farm.useToken(result))
+            .then(token => token)
+            .catch((error) => { throw error; })
+          .catch((error) => { throw error; });
+      }
     },
     logout() {
-      this.cookie = '';
-      return request('/user/logout');
+      if (farm.token != null) {
+        return farm.token.revokeAll().then(farm.token = null);
+      }
+      return Promise.resolve();
     },
-    cookie: '',
+    token: null,
+    csrfToken: null,
     area: {
-      delete(id, token) {
+      delete(id) {
         return request('/taxonomy_vocabulary.json').then(res => (
-          request(`/taxonomy_term.json?vocabulary=${areaVid(res)}${params(id)}`, { method: 'DELETE', token })
+          request(`/taxonomy_term.json?vocabulary=${areaVid(res)}${params(id)}`, { method: 'DELETE' })
         ));
       },
       get(opts = {}) {
@@ -152,15 +210,15 @@ function farmOS(host, user, password) {
           return request(`/taxonomy_term.json?vocabulary=${areaVid(res)}&${typeParams}&${pageParams}`);
         });
       },
-      send(payload, id, token) {
+      send(payload, id) {
         return request('/taxonomy_vocabulary.json').then(res => (
-          request(`/taxonomy_term.json?vocabulary=${areaVid(res)}${params(id)}`, { method: 'POST', payload, token })
+          request(`/taxonomy_term.json?vocabulary=${areaVid(res)}${params(id)}`, { method: 'POST', payload })
         ));
       },
     },
     asset: {
-      delete(id, token) {
-        return request(`/farm_asset/${id}.json`, { method: 'DELETE', token });
+      delete(id) {
+        return request(`/farm_asset/${id}.json`, { method: 'DELETE' });
       },
       get(opts = {}) {
         // If an ID # is passed instead of an options object
@@ -186,8 +244,8 @@ function farmOS(host, user, password) {
         // If no ID is passed but page is passed
         return request(`/farm_asset.json?${typeParams}${archiveParams}${pageParams}`);
       },
-      send(payload, id, token) {
-        return request(`/farm_asset${params(id)}`, { method: 'POST', payload, token });
+      send(payload, id) {
+        return request(`/farm_asset${params(id)}`, { method: 'POST', payload });
       },
     },
     info() {
@@ -195,8 +253,8 @@ function farmOS(host, user, password) {
       return request('/farm.json');
     },
     log: {
-      delete(id, token) {
-        return request(`/log/${id}.json`, { method: 'DELETE', token });
+      delete(id) {
+        return request(`/log/${id}.json`, { method: 'DELETE' });
       },
       get(opts = {}) {
         // If an ID # is passed instead of an options object
@@ -235,9 +293,9 @@ function farmOS(host, user, password) {
         // Otherwise request all pages
         return requestAll(query);
       },
-      send(payload, token) {
+      send(payload) {
         if (payload.id) {
-          return request(`/log/${payload.id}`, { method: 'PUT', payload, token })
+          return request(`/log/${payload.id}`, { method: 'PUT', payload })
             // Add properties back to response so it mirrors a POST response
             .then(res => ({
               ...res,
@@ -246,7 +304,7 @@ function farmOS(host, user, password) {
               resource: 'log',
             }));
         }
-        return request('/log', { method: 'POST', payload, token });
+        return request('/log', { method: 'POST', payload });
       },
     },
     term: {
@@ -279,11 +337,11 @@ function farmOS(host, user, password) {
           appendParam('page', page),
         )(query);
       },
-      send(payload, token) {
+      send(payload) {
         if (payload.tid) {
-          return request(`/taxonomy_term/${payload.tid}`, { method: 'PUT', payload, token });
+          return request(`/taxonomy_term/${payload.tid}`, { method: 'PUT', payload });
         }
-        return request('/taxonomy_term', { method: 'POST', payload, token });
+        return request('/taxonomy_term', { method: 'POST', payload });
       },
     },
     vocabulary(machineName) {

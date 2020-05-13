@@ -21,7 +21,8 @@
   "homepage": "https://github.com/farmOS/farmOS.js#readme",
   "dependencies": {
     "axios": "^0.18.1",
-    "ramda": "^0.26.1"
+    "ramda": "^0.26.1",
+    "simple-oauth2": "^3.4.0"
   },
   "devDependencies": {
     "eslint": "^5.16.0",
